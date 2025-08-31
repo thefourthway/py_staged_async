@@ -1,4 +1,4 @@
-import functools
+import inspect
 import typing
 
 
@@ -21,9 +21,13 @@ class _ResultUnset:
 # The final return value of our SAO, stored in SAO._result
 _R = typing.TypeVar('_R')
 
+_RCV = typing.TypeVar('_RCV', covariant=True)
 
 # The generator returned by the client function
 AsyncClientEventGeneratorT: typing.TypeAlias = "typing.AsyncGenerator[_OperationEvent | _R, _OperationEvent]"
+SyncClientEventGeneratorT: typing.TypeAlias = "typing.Generator[_OperationEvent | _R, _OperationEvent, None]"
+
+SAOClientEventGeneratorT: typing.TypeAlias = 'AsyncClientEventGeneratorT[_R] | SyncClientEventGeneratorT[_R]'
 
 # The generator returned by SAOGenerator.generate
 AsyncEventGeneratorT: typing.TypeAlias = "typing.AsyncGenerator[_OperationEvent, None]"
@@ -37,7 +41,7 @@ _GeneratorItemState: typing.TypeAlias = "_OperationEvent | _R | type[_ItemUnset]
 
 class SAOClientCallable(typing.Protocol[_R]):
     def __call__(self, sao: 'SAO[_R]',
-                 *args: typing.Any, **kwargs: typing.Any) -> 'AsyncClientEventGeneratorT[_R]': ...
+                 *args: typing.Any, **kwargs: typing.Any) -> 'SAOClientEventGeneratorT[_R]': ...
 
 
 # The "awaitable" variant where all events are folded at once
@@ -47,12 +51,12 @@ SAOResultAwaitable: typing.TypeAlias = 'typing.Awaitable[_R]'
 SAOAwaitGenerator: typing.TypeAlias = 'typing.Generator[typing.Any, typing.Any, _R]'
 
 # The event iterator type for SAO.__call__
-SAOEventIterator: typing.TypeAlias = "typing.AsyncIterator[tuple[SAO[_R], _OperationEvent]]"
+SAOEventIterator: typing.TypeAlias = "typing.AsyncIterator[_OperationEvent]"
 
 
-class SAOAwaitableSuperposition(typing.Protocol[_R]):
-    def __await__(self) -> 'SAOAwaitGenerator[_R]': ...
-    def __aiter__(self) -> 'SAOEventIterator[_R]': ...
+class SAOAwaitableSuperposition(typing.Protocol[_RCV]):
+    def __await__(self) -> 'SAOAwaitGenerator[_RCV]': ...
+    def __aiter__(self) -> 'SAOEventIterator': ...
 
 
 class _SAOSuperposition(typing.Generic[_R]):
@@ -64,10 +68,10 @@ class _SAOSuperposition(typing.Generic[_R]):
 
         return typing.cast('SAOAwaitGenerator[_R]', quantum_state.__await__())
 
-    def __aiter__(self) -> 'SAOEventIterator[_R]':
+    def __aiter__(self) -> 'SAOEventIterator':
         quantum_state = object.__getattribute__(self, '_quantum_state')
 
-        return typing.cast('SAOEventIterator[_R]', quantum_state.__aiter__())
+        return typing.cast('SAOEventIterator', quantum_state.__aiter__())
 
     def __getattribute__(self, name: str) -> typing.Any:
         if hasattr(self, name):
@@ -97,11 +101,11 @@ class _OperationEvent:
         self._allow_args = None
 
     @property
-    def stage_id(self):
+    def stage_id(self) -> str:
         return self._stage_id
 
     @property
-    def event_id(self):
+    def event_id(self) -> str:
         return self._event_id
 
     @property
@@ -124,6 +128,10 @@ class _OperationEvent:
     def has_been_stamped(self) -> bool:
         return self._approval_status != _ApprovalUnset
 
+    @property
+    def combined_id(self):
+        return f'{self.stage_id}.{self.event_id}'
+    
     def __hash__(self) -> int:
         return hash(self._stage_id)
 
@@ -165,6 +173,33 @@ class _OperationStage:
     def __exit__(self, *_):
         pass
 
+class _SyncGenAdapter(typing.AsyncGenerator["_OperationEvent | _R", "_OperationEvent"]):
+    def __init__(self, gen: "SyncClientEventGeneratorT[_R]") -> None:
+        self._gen = gen
+
+    def __aiter__(self) -> "typing.AsyncIterator[_OperationEvent | _R]":
+        return self
+
+    async def __anext__(self) -> "_OperationEvent | _R":
+        try:
+            return next(self._gen)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def asend(self, value: "_OperationEvent") -> "_OperationEvent | _R":  # type: ignore[override]
+        try:
+            return self._gen.send(value)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def athrow(self, typ, val=None, tb=None) -> "_OperationEvent | _R":  # type: ignore[override]
+        try:
+            return self._gen.throw(typ, val, tb)
+        except StopIteration:
+            raise StopAsyncIteration
+
+    async def aclose(self) -> None:  # type: ignore[override]
+        self._gen.close()
 
 class _SAOGenerator(typing.Generic[_R]):
     def __init__(self, sao: 'SAO[_R]', fn: 'SAOClientCallable[_R]', *args: typing.Any, **kwargs: typing.Any):
@@ -192,11 +227,17 @@ class _SAOGenerator(typing.Generic[_R]):
             raise RuntimeError('The SAO that can be re-entered is not the true SAO')
 
         if self._fn_async_generator is None:
-            self._fn_async_generator = self._fn(
+            raw = self._fn(
                 self._sao,
                 *self._fn_args,
                 **self._fn_kwargs
             )
+
+            if inspect.isgenerator(raw):
+                self._fn_async_generator = _SyncGenAdapter(typing.cast("SyncClientEventGeneratorT[_R]", raw))
+            else:
+                # assume already an async generator
+                self._fn_async_generator = typing.cast("AsyncClientEventGeneratorT[_R]", raw)
 
         if self._fn_async_generator == _DeadGenerator:
             raise RuntimeError('The SAO that can be re-entered is not the true SAO')
@@ -271,7 +312,7 @@ class SAO(typing.Generic[_R]):
         self._sao_generator_obj = None
         self._event_generator = None
 
-    def __call__(self, fn: 'SAOClientCallable[_R]', *args: typing.Any, **kwargs: typing.Any) -> 'SAOEventIterator[_R]':
+    def __call__(self, fn: 'SAOClientCallable[_R]', *args: typing.Any, **kwargs: typing.Any) -> 'SAOEventIterator':
         if self._sao_generator_obj is not None or self._event_generator is not None:
             raise RuntimeError('SAO has already been initialized')
 
@@ -288,7 +329,7 @@ class SAO(typing.Generic[_R]):
 
             try:
                 async for item in self._event_generator:
-                    yield self, item
+                    yield item
             except Exception:
                 raise
             finally:
@@ -300,13 +341,13 @@ class SAO(typing.Generic[_R]):
 async def complete_sao_call(fn: 'SAOClientCallable[_R]', *args: typing.Any, **kwargs: typing.Any) -> '_R':
     sao_obj = SAO[_R]()
 
-    async for sao_obj, event in sao_obj(fn, *args, **kwargs):
+    async for event in sao_obj(fn, *args, **kwargs):
         event.approve()
 
     return sao_obj.result()
 
 
-def iterate_sao(fn: 'SAOClientCallable[_R]', *args: typing.Any, **kwargs: typing.Any) -> 'SAOEventIterator[_R]':
+def iterate_sao(fn: 'SAOClientCallable[_R]', *args: typing.Any, **kwargs: typing.Any) -> 'SAOEventIterator':
     return SAO[_R]()(fn, *args, **kwargs)
 
 
@@ -331,7 +372,7 @@ def default_sao(fn: 'SAOClientCallable[_R]') -> 'typing.Callable[..., SAOAwaitab
                 # here, someone has called sao(provide_default_sao), opting to provide their own event handlers.
                 # args[1] under normal circumstances will just be provide_defaultSAO, so we skip it
 
-                res: 'SAOEventIterator[_R]' = sao_obj(
+                res: 'SAOEventIterator' = sao_obj(
                     realized_fn, *rest, **kwargs
                 )  # type: ignore
 
