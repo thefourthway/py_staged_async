@@ -1,3 +1,4 @@
+import contextlib
 import inspect
 import types
 import typing
@@ -213,7 +214,8 @@ class _SAOGenerator(typing.Generic[_R]):
 
         if self._fn_async_generator == _DeadGenerator:
             raise RuntimeError(
-                'The SAO that can be re-entered is not the true SAO')
+                'The SAO that can be re-entered is not the true SAO'
+            )
 
         if self._fn_async_generator is None:
             raw = self._fn(
@@ -236,15 +238,13 @@ class _SAOGenerator(typing.Generic[_R]):
 
         item: _OperationEvent | _R
         send: _OperationEvent | None = None
+        closed: bool = False
 
         try:
             while True:
                 try:
-                    if send is None:
-                        item = await anext(gen)
-                    else:
-                        item = await gen.asend(send)
-                        send = None
+                    item = await (anext(gen) if send is None else gen.asend(send))
+                    send = None
                 except StopAsyncIteration:
                     break
 
@@ -259,10 +259,25 @@ class _SAOGenerator(typing.Generic[_R]):
                     if item.has_been_approved:
                         send = item
                     else:
-                        raise StopAsyncIteration
+                        with contextlib.suppress(Exception):
+                            await gen.aclose()
+
+                        closed = True
+                        break
         except Exception:
+            if not closed:
+                with contextlib.suppress(Exception, RuntimeError):
+                    await gen.aclose()
+                closed = True
+
             raise
         finally:
+            if not closed:
+                with contextlib.suppress(Exception, RuntimeError):
+                    await gen.aclose()
+
+                closed = True
+                
             final_item = self._previous_yield
 
             if not isinstance(final_item, _OperationEvent) and final_item != _ItemUnset:
@@ -291,7 +306,8 @@ class SAO(typing.Generic[_R]):
     def result(self) -> _R:
         if self._result == _ResultUnset:
             raise RuntimeError(
-                'No result was returned by the client generator')
+                'No result was returned by the client generator'
+            )
 
         return typing.cast(_R, self._result)
 
@@ -315,7 +331,8 @@ class SAO(typing.Generic[_R]):
 
             if real_fn is None:
                 raise RuntimeError(
-                    'The SAO that is not decorated is not the true SAO')
+                    'The SAO that is not decorated is not the true SAO'
+                )
 
             self._sao_generator_obj = _SAOGenerator(
                 self, real_fn, *args, **kwargs
